@@ -5,8 +5,12 @@ configures an experiment and launches an isolated Isaac runtime. The existing
 spark_pipeline.autonomy.unitree_g1_environment_tensor_walk owns the scene, task,
 tensor control loop, WBT/Sport inference, and per-environment resets. It uses
 static Marble or GPT-v4 assets without people, animation, or replay cameras.
+The marble-full option adds original SPZ appearance over the static collider.
 
 Examples (run in the same Isaac Lab environment as the tensor example)::
+
+    python scrpits/run_unitree_g1_usd_environment_walk_benchmark.py \
+        --environment marble-full
 
     python scrpits/run_unitree_g1_usd_environment_walk_benchmark.py \
         --environment gpt-v4 --robot-position-mode random
@@ -26,8 +30,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 
@@ -56,6 +62,16 @@ ENVIRONMENT_ASSETS = {
         "terrain_mesh": None,
     },
 }
+# Reuse the identical static collider; appearance comes from the original SPZ.
+MARBLE_FULL_PACKAGE = REPO_ROOT / "reconstructions/marble-1.1-supermarket-full-appearance-1s-18s"
+ENVIRONMENT_ASSETS["marble-full"] = {
+    **ENVIRONMENT_ASSETS["marble"],
+    "gaussian_dir": MARBLE_FULL_PACKAGE / "assets/marble_1_1_people_1s_18s",
+    "gaussian_alignment": MARBLE_FULL_PACKAGE / "outputs/marble-people-1s-18s/alignment.json",
+}
+GAUSSIAN_FILES = {"full": "world_full_res.spz", "500k": "world_500k.spz",
+                  "150k": "world_150k.spz", "100k": "world_100k.spz"}
+
 POLICY_RUNTIME = {
     "UnitreeG1WBTSafePolicy": "wbtsafe",
     "UnitreeG1SportSafePolicy": "sportsafe",
@@ -85,6 +101,8 @@ FLOAT_OPTIONS = {
     "camera_distance": 3.0,
     "camera_height": 2.0,
     "camera_lookahead": 1.5,
+    "camera_follow_smoothing": .35,
+    "camera_clearance": .18,
     "interior_light_intensity": 1600.0,
     "camera_light_intensity": 1000.0,
     "interior_ambient_intensity": .8,
@@ -104,6 +122,19 @@ def build_parser(*, for_runtime: bool = False) -> argparse.ArgumentParser:
     for name, default in FLOAT_OPTIONS.items():
         parser.add_argument("--" + name.replace("_", "-"), type=float, default=default)
     parser.add_argument("--environment", choices=tuple(ENVIRONMENT_ASSETS), default="marble")
+    parser.add_argument("--camera-mode", choices=("fixed", "follow"), default="fixed",
+                        help="fixed episode view (default), or stable robot-following view")
+    parser.add_argument("--record-video", action="store_true",
+                        help="record MP4 views; marble-full records both mesh and GS")
+    parser.add_argument("--video-dir", type=Path, default=Path("videos"), help="MP4 output directory (default: ./videos)")
+    parser.add_argument("--video-fps", type=float, default=None,
+                        help="playback FPS; default: 50 / render-every, matching simulation time")
+    parser.add_argument("--gaussian-quality", choices=tuple(GAUSSIAN_FILES), default="full",
+                        help="marble-full appearance resolution; default: all 1.92M Gaussians")
+    parser.add_argument("--gaussian-resolution", nargs=2, type=int, default=(960, 720),
+                        metavar=("WIDTH", "HEIGHT"), help="composite image size")
+    parser.add_argument("--gaussian-snapshot", type=Path,
+                        help="save the final composite PNG; also enables rendering when headless")
     parser.add_argument("--world-dir", type=Path, default=None,
                         help="override this environment's static asset directory")
     parser.add_argument("--init-mode", choices=("random", "fixed-start", "fixed-goal"),
@@ -138,6 +169,8 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
     """Reject invalid experiments and missing scene assets before Kit starts."""
     if args.steps == 0 or args.steps < -1:
         parser.error("--steps must be positive or -1")
+    if args.video_fps is not None and (not math.isfinite(args.video_fps) or args.video_fps <= 0):
+        parser.error("--video-fps must be finite and positive")
     for name in ("num_envs", "episode_steps", "render_every"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be at least 1")
@@ -157,6 +190,15 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
         if getattr(args, name) > 180:
             parser.error(f"--{name.replace('_', '-')} must be in (0, 180]")
     asset = ENVIRONMENT_ASSETS[args.environment]
+    if any(v < 64 or v > 1920 for v in args.gaussian_resolution):
+        parser.error("--gaussian-resolution dimensions must be in [64, 1920]")
+    if args.gaussian_snapshot is not None and "gaussian_dir" not in asset:
+        parser.error("--gaussian-snapshot requires --environment marble-full")
+    if "gaussian_dir" in asset:
+        for path in (asset["gaussian_dir"] / GAUSSIAN_FILES[args.gaussian_quality],
+                     asset["gaussian_alignment"]):
+            if not path.is_file():
+                parser.error(f"Gaussian asset not found: {path}")
     legacy_modes = {
         "random": ("random", "random", "random"),
         "fixed-start": ("manual", "manual", "random"),
@@ -207,6 +249,10 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
         inventory = json.loads(inventory_path.read_text())
         world = next(record for record in inventory if record.get("path") == manifest["static_environment_prim"])
         bounds = world["world_bounds_default"]
+        args.camera_bounds_min = [float(v) for v in bounds["min"]]
+        args.camera_bounds_max = [float(v) for v in bounds["max"]]
+        args.camera_bounds_min[2] += asset["world_z_offset"]
+        args.camera_bounds_max[2] += asset["world_z_offset"]
         low = [float(bounds["min"][axis]) + args.wall_margin for axis in (0, 1)]
         high = [float(bounds["max"][axis]) - args.wall_margin for axis in (0, 1)]
         if not all(math.isfinite(v) for v in (*low, *high)):
@@ -242,16 +288,18 @@ def build_runtime_command(args, launcher_args=()) -> list[str]:
     policy = POLICY_RUNTIME[args.policy_config] if args.policy_config else (args.policy or "wbtsafe")
     command = [sys.executable, str(RUNTIME), "--policy", policy]
     for name in (*INTEGER_OPTIONS, *FLOAT_OPTIONS, "environment", "robot_position_mode", "robot_yaw_mode", "goal_position_mode", "world_dir",
-                 "robot_yaw_degrees", "spawn_height", "seed", "device"):
+                 "robot_yaw_degrees", "spawn_height", "seed", "device", "gaussian_quality", "gaussian_snapshot", "camera_mode", "video_dir", "video_fps"):
         value = getattr(args, name)
         if value is not None:
             command.extend(("--" + name.replace("_", "-"), str(value)))
-    for name in ("robot_position", "goal_position", "sampling_bounds"):
+    for name in ("robot_position", "goal_position", "sampling_bounds", "gaussian_resolution"):
         values = getattr(args, name)
         if values is not None:
             command.extend(("--" + name.replace("_", "-"), *(str(v) for v in values)))
     if args.headless:
         command.append("--headless")
+    if args.record_video:
+        command.append("--record-video")
     command.append("--real-time" if args.real_time else "--no-real-time")
     command.extend(launcher_args)
     return command
@@ -263,6 +311,28 @@ def run(args, launcher_args=()) -> subprocess.CompletedProcess | None:
     print(f"[Environment high level] {shlex.join(command)}", flush=True)
     if args.dry_run:
         return None
+    if args.record_video:
+        # subprocess.run kills its child on KeyboardInterrupt. Give the recorder
+        # a chance to write the MP4 index before Isaac shuts down instead.
+        process = subprocess.Popen(command, start_new_session=(os.name == "posix"))
+        interrupted = False
+        while True:
+            try:
+                code = process.wait()
+                break
+            except KeyboardInterrupt:
+                if not interrupted and process.poll() is None:
+                    interrupted = True
+                    print("[Video] stopping runtime; waiting for MP4 finalization...", flush=True)
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGINT)
+                    else:
+                        process.send_signal(signal.SIGINT)
+        if interrupted:
+            raise KeyboardInterrupt
+        if code:
+            raise subprocess.CalledProcessError(code, command)
+        return subprocess.CompletedProcess(command, code)
     return subprocess.run(command, check=True)
 
 

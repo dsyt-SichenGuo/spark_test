@@ -33,7 +33,7 @@ def configured_args(environment, mode):
     return args
 
 
-@pytest.mark.parametrize("environment", ["marble", "gpt-v4"])
+@pytest.mark.parametrize("environment", ["marble", "gpt-v4", "marble-full"])
 @pytest.mark.parametrize("position_mode", ["random", "manual"])
 @pytest.mark.parametrize("yaw_mode", ["random", "manual"])
 @pytest.mark.parametrize("goal_mode", ["random", "manual"])
@@ -91,7 +91,7 @@ def test_independent_episode_modes(environment, position_mode, yaw_mode, goal_mo
         previous = (start.clone(), yaw.clone(), goal.clone())
 
 
-@pytest.mark.parametrize("environment", ["marble", "gpt-v4"])
+@pytest.mark.parametrize("environment", ["marble", "gpt-v4", "marble-full"])
 def test_default_modes_are_random_and_runtime_command_preserves_modes(environment):
     parser = launcher.build_parser()
     args = parser.parse_args(["--environment", environment])
@@ -248,7 +248,30 @@ def test_indoor_fill_light_is_authored_with_shadows_disabled():
     assert tuple(translate.Get()) == (1., 2., 1.3)
 
 
-@pytest.mark.parametrize("environment", ["marble", "gpt-v4"])
+def test_original_marble_corridor_lights_only_illuminate_each_clone_mesh():
+    from pxr import Usd, UsdGeom, UsdLux
+    stage = Usd.Stage.CreateInMemory()
+    for env_id in range(2):
+        UsdGeom.Mesh.Define(stage, f"/World/StaticWalkTask/env_{env_id}/Scene/Environment/Mesh")
+        UsdGeom.Mesh.Define(stage, f"/World/envs/env_{env_id}/Robot/body")
+    runtime.add_marble_mesh_corridor_lights(stage, [[0., 0., 0.], [20., 0., 0.]])
+    for env_id in range(2):
+        for index in range(4):
+            light = UsdLux.SphereLight(stage.GetPrimAtPath(
+                f"/World/StaticWalkTask/env_{env_id}/Lighting/MarbleCorridor_{index}"))
+            assert light.GetIntensityAttr().Get() == 6000.
+            assert light.GetRadiusAttr().Get() == pytest.approx(.35)
+            assert light.GetNormalizeAttr().Get() is False  # Original lamp default.
+            query = UsdLux.LightAPI(light.GetPrim()).GetLightLinkCollectionAPI().ComputeMembershipQuery()
+            assert query.IsPathIncluded(f"/World/StaticWalkTask/env_{env_id}/Scene/Environment/Mesh")
+            assert not query.IsPathIncluded(f"/World/envs/env_{env_id}/Robot/body")
+            assert not query.IsPathIncluded(f"/World/StaticWalkTask/env_{1-env_id}/Scene/Environment/Mesh")
+        matrix = UsdGeom.Xformable(stage.GetPrimAtPath(
+            f"/World/StaticWalkTask/env_{env_id}/Lighting/MarbleCorridor_0")).ComputeLocalToWorldTransform(0)
+        assert tuple(matrix.ExtractTranslation()) == pytest.approx((-7.5 + env_id * 20., -14., 1.25))
+
+
+@pytest.mark.parametrize("environment", ["marble", "gpt-v4", "marble-full"])
 def test_selected_assets_have_collisions_and_no_people_or_animation(environment):
     pytest.importorskip("pxr")
     from pxr import Usd, UsdGeom, UsdPhysics
@@ -300,3 +323,307 @@ def test_manual_unsupported_floor_fails_without_randomizing_anchor(unsupported):
         runtime.sample_episode(torch, args=args, env_origins=torch.zeros(1, 3),
                                xy_min=args.xy_min, xy_max=args.xy_max,
                                spawn_base_z=.793, ground_sampler=ground)
+
+
+def test_gaussian_alignment_matches_every_original_collider_vertex():
+    import json
+    import numpy as np
+    import trimesh
+    from pxr import Usd
+    module = load_module("gaussian_compositor", "tools/marble_gaussian_compositor.py")
+    asset = launcher.ENVIRONMENT_ASSETS["marble-full"]
+    alignment = json.loads(asset["gaussian_alignment"].read_text())
+    rotation, shift, scale = module.gaussian_to_collider_transform(alignment)
+    mesh = trimesh.load(asset["gaussian_dir"] / "collider_mesh.glb", force="scene").to_geometry()
+    points = np.asarray(mesh.vertices) @ rotation.T * scale + shift
+    stage = Usd.Stage.Open(str(asset["world_dir"] / "marble-1.1-static.usdc"))
+    expected = np.asarray(stage.GetPrimAtPath("/World/MarbleCollider").GetAttribute("points").Get())
+    np.testing.assert_allclose(points, expected, atol=1e-6, rtol=0)
+
+
+def test_depth_composition_occludes_robot_behind_shelf_and_handles_empty_background():
+    import numpy as np
+    module = load_module("gaussian_compositor", "tools/marble_gaussian_compositor.py")
+    gs = np.zeros((1, 4, 3), dtype=np.uint8)
+    native = np.full_like(gs, 200)
+    z = np.array([[2., 2., 2., 2.]])
+    nz = np.array([[1., 3., np.inf, 3.]])
+    alpha = np.array([[1., 1., 1., 0.]])
+    image, stats = module.compose_depth(gs, z, alpha, native, nz)
+    np.testing.assert_array_equal(image[0, :, 0], [200, 0, 0, 200])
+    assert stats == {"native_pixels": 3, "visible_native_pixels": 2, "occluded_native_pixels": 1}
+
+
+def test_gaussian_assets_decode_with_valid_unit_quaternions():
+    import numpy as np
+    module = load_module("gaussian_compositor", "tools/marble_gaussian_compositor.py")
+    asset = launcher.ENVIRONMENT_ASSETS["marble-full"]
+    xyz, quats, scales, rgb, alpha = module.load_spz(asset["gaussian_dir"] / "world_100k.spz")
+    assert xyz.shape == (98304, 3)
+    assert np.isfinite(xyz).all() and (scales > 0).all()
+    np.testing.assert_allclose(np.linalg.norm(quats, axis=1), 1., atol=1e-6)
+    assert ((rgb >= 0) & (rgb <= 1)).all()
+    assert ((alpha >= 0) & (alpha <= 1)).all()
+
+
+def test_full_appearance_does_not_change_seeded_task_sampling():
+    parser = launcher.build_parser()
+    results = []
+    for environment in ("marble", "marble-full"):
+        args = parser.parse_args(["--environment", environment])
+        launcher.validate_args(args, parser)
+        asset = launcher.ENVIRONMENT_ASSETS[environment]
+        torch.manual_seed(19)
+        results.append(runtime.sample_episode(torch, args=args, env_origins=torch.zeros(4, 3),
+                                              xy_min=args.xy_min, xy_max=args.xy_max,
+                                              spawn_base_z=asset["spawn_base_z"]))
+    for original, full in zip(*results):
+        torch.testing.assert_close(original, full, atol=0, rtol=0)
+
+
+def test_static_gaussian_cache_refreshes_native_robot_and_invalidates_on_view_change():
+    import numpy as np
+    from types import SimpleNamespace
+    module = load_module("gaussian_compositor", "tools/marble_gaussian_compositor.py")
+    compositor = module.MarbleGaussianCompositor.__new__(module.MarbleGaussianCompositor)
+    compositor.width = compositor.height = 2
+    compositor.gui = False
+    compositor.frames = compositor.gaussian_renders = 0
+    compositor._cached_view = compositor._cached_gaussians = None
+    compositor.pending_c2w = np.eye(4)
+    lens = [18.]
+    compositor.camera = SimpleNamespace(
+        GetFocalLengthAttr=lambda: SimpleNamespace(Get=lambda: lens[0]),
+        GetHorizontalApertureAttr=lambda: SimpleNamespace(Get=lambda: 20.955))
+    native = np.ones((2, 2, 3), dtype=np.uint8)
+    compositor.rgb = SimpleNamespace(get_data=lambda: native)
+    compositor.depth = SimpleNamespace(get_data=lambda: np.ones((2, 2)))
+    compositor.instances = SimpleNamespace(get_data=lambda: {
+        "data": np.ones((2, 2), dtype=np.uint32),
+        "info": {"idToLabels": {1: "/World/envs/env_0/Robot/body"}}})
+    calls = []
+    def render(camera):
+        calls.append(camera.copy())
+        return np.zeros_like(native), np.full((2, 2), 2.), np.ones((2, 2))
+    compositor._render_gaussians = render
+    compositor.update()
+    native[:] = 200  # Robot moves while the static camera/scene stays fixed.
+    compositor.update()
+    assert len(calls) == 1
+    np.testing.assert_array_equal(compositor.last_image, native)
+    compositor.pending_c2w[0, 3] = 20.  # Episode reset or selected clone changes.
+    compositor.update()
+    lens[0] = 24.  # Camera zoom also changes the projected background/depth.
+    compositor.update()
+    assert len(calls) == 3 and compositor.frames == 4
+
+
+def test_gs_inset_excludes_visible_mesh_but_keeps_robot_and_goal_depth():
+    import numpy as np
+    module = load_module("gaussian_compositor", "tools/marble_gaussian_compositor.py")
+    original = np.ones((1, 4), dtype=np.float32)
+    instances = {"data": np.array([[1, 2, 3, 4]], dtype=np.uint32), "info": {"idToLabels": {
+        "1": "/World/StaticWalkTask/env_0/Scene/Environment/MarbleCollider",
+        2: "/World/envs/env_0/Robot/body", 3: "/World/StaticWalkTask/Goals/Goal_0",
+        4: "/World/StaticWalkTask/env_1/Scene/Environment/MarbleCollider"}}}
+    depth, count = module.exclude_environment_depth(original, instances)
+    np.testing.assert_array_equal(depth, [[np.inf, 1., 1., np.inf]])
+    np.testing.assert_array_equal(original, np.ones((1, 4)))
+    assert count == 2
+
+
+@pytest.mark.parametrize("inherited,expected", [("10.1", "8.9"), ("", "8.9"),
+                                                ("8.9", "8.9"), ("8.9+PTX", "8.9+PTX")])
+def test_gaussian_architecture_repairs_invalid_shell_override(monkeypatch, inherited, expected):
+    import os
+    from types import SimpleNamespace
+    module = load_module("gaussian_compositor", "tools/marble_gaussian_compositor.py")
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", inherited)
+    selected = []
+    def capability(device):
+        selected.append(device)
+        return 8, 9
+    fake_torch = SimpleNamespace(cuda=SimpleNamespace(get_device_capability=capability))
+    module.configure_gaussian_architecture(fake_torch, "cuda:1")
+    assert os.environ["TORCH_CUDA_ARCH_LIST"] == expected
+    assert selected == ["cuda:1"]
+
+
+@pytest.mark.parametrize("environment", ["marble", "marble-full", "gpt-v4"])
+def test_camera_modes_forward_to_runtime(environment):
+    parser = launcher.build_parser()
+    assert parser.parse_args([]).camera_mode == "fixed"
+    args = parser.parse_args(["--environment", environment, "--camera-mode", "follow"])
+    launcher.validate_args(args, parser)
+    command = launcher.build_runtime_command(args)
+    assert command[command.index("--camera-mode") + 1] == "follow"
+
+
+def test_follow_camera_preserves_initial_view_distance_and_ignores_body_bob():
+    pose = [1., 2., .8, 0., 0., 0., 1.]
+    eye, target = runtime.episode_camera_view(pose, [7., 5.], distance=3., height=2., lookahead=1.5)
+    camera = runtime.StableFollowCamera(pose, eye, target, .35)
+    initial = camera.update(pose, 0.)
+    assert initial[0] == pytest.approx(eye)
+    assert initial[1] == pytest.approx(target)
+    moved = [5., -3., .1, 0., 0., math.sin(math.pi / 4), math.cos(math.pi / 4)]
+    for _ in range(200):
+        actual_eye, actual_target = camera.update(moved, .02)
+        assert math.dist(actual_eye[:2], moved[:2]) == pytest.approx(3.)
+        assert actual_eye[2] == pytest.approx(eye[2])
+        assert actual_target[2] == pytest.approx(target[2])
+    assert actual_eye[:2] == pytest.approx([5., -6.], abs=1e-4)
+
+
+def test_follow_camera_turns_smoothly_across_yaw_wrap_and_holds_during_fall():
+    pose = [0., 0., .8, 0., 0., math.sin(math.radians(179)/2), math.cos(math.radians(179)/2)]
+    direction = [math.cos(math.radians(179)), math.sin(math.radians(179))]
+    eye, target = runtime.episode_camera_view(pose, direction, distance=3., height=2., lookahead=1.5)
+    camera = runtime.StableFollowCamera(pose, eye, target, .35)
+    initial_heading = camera.heading
+    pose[5:] = [math.sin(math.radians(-179)/2), math.cos(math.radians(-179)/2)]
+    camera.update(pose, .02)
+    assert 0 < camera.heading - initial_heading < math.radians(2.)
+    heading = camera.heading
+    pose[3:] = [1., 0., 0., 0.]  # upside down: do not orbit with the tumble
+    camera.update(pose, .1, float("nan"))
+    assert camera.heading == heading and camera.anchor_z == .8
+
+
+def test_follow_camera_keeps_collision_calibrated_initial_distance():
+    pose = [0., 0., .8, 0., 0., 0., 1.]
+    camera = runtime.StableFollowCamera(pose, [-1.2, 0., 1.5], [.18, 0., .8], .35)
+    eye, target = camera.update([2., 1., 2., 0., 0., 0., 1.], .1)
+    assert math.dist(eye[:2], [2., 1.]) == pytest.approx(1.2)
+    assert eye[2] == 1.5 and target[2] == .8
+
+
+def test_follow_runtime_tracks_selected_clone_and_fixed_mode_does_not_move_camera():
+    from types import SimpleNamespace
+    pipeline = runtime.EnvironmentTensorPipeline.__new__(runtime.EnvironmentTensorPipeline)
+    pipeline.follow_camera = None
+    pipeline.agent = SimpleNamespace(get_feedback=lambda: pytest.fail("fixed mode must not follow"))
+    pipeline._update_follow_camera()
+    pipeline.follow_camera = runtime.StableFollowCamera([20., 0., .8, 0., 0., 0., 1.],
+                                                       [17., 0., 2.8], [21., 0., .8], .35)
+    pipeline.camera_env_id = 1
+    pipeline.camera_origin = [20., 0., 0.]
+    pipeline.camera_last_step = 0
+    pipeline.pipeline_step = 5
+    pipeline.ground_sampler = None
+    pipeline.args = SimpleNamespace(camera_bounds_min=[-10., -10., -1.],
+                                    camera_bounds_max=[10., 10., 5.], camera_clearance=.18)
+    pipeline.agent = SimpleNamespace(get_feedback=lambda: {"root_pose_w": torch.tensor([
+        [0., 0., .8, 0., 0., 0., 1.], [22., 1., .2, 0., 0., 0., 1.]])})
+    views = []
+    pipeline._set_camera_view = lambda eye, target: views.append((eye, target))
+    pipeline._update_follow_camera()
+    assert views[0][0] == pytest.approx([19., 1., 2.8])
+    assert views[0][1] == pytest.approx([23., 1., .8])
+    assert pipeline.camera_last_step == 5
+
+
+def test_follow_camera_retracts_at_scene_bounds_and_smoothly_recovers():
+    camera = runtime.StableFollowCamera([0., 0., .8, 0., 0., 0., 1.],
+                                       [-3., 0., 2.8], [1., 0., .8], .35)
+    bounds = dict(bounds_min=[-4., -4., -.5], bounds_max=[4., 4., 3.], dt=.1)
+    anchor = [-3.5, 0., .95]
+    eye = camera.constrain([-6.5, 0., 2.8], anchor, **bounds)
+    assert eye[0] >= -3.82
+    shortened = camera.safe_fraction
+    assert 0 < shortened < .2
+    recovered = camera.constrain([-3., 0., 2.8], [0., 0., .95], **bounds)
+    assert shortened < camera.safe_fraction < 1.
+    assert -3. < recovered[0] < 0.
+    # Even a robot outside the bounds cannot drag the camera outside.
+    eye = camera.constrain([-15., 0., 9.], [-12., 0., 7.], **bounds)
+    assert -3.82 <= eye[0] <= 3.82 and -.32 <= eye[2] <= 2.82
+
+
+def test_follow_camera_stays_inside_walls_and_roof_while_turning():
+    import numpy as np
+    wall = [[[-1., -4., -.5], [-1., 4., -.5], [-1., 4., 1.5]],
+            [[-1., -4., -.5], [-1., 4., 1.5], [-1., -4., 1.5]]]
+    roof = [[[-4., -4., 1.5], [4., -4., 1.5], [4., 4., 1.5]],
+            [[-4., -4., 1.5], [4., 4., 1.5], [-4., 4., 1.5]]]
+    ground = runtime.GroundSurfaceSampler(np.asarray(wall + roof), -.5)
+    camera = runtime.StableFollowCamera([0., 0., .3, 0., 0., 0., 1.],
+                                       [-.5, 0., 1.], [.1, 0., .3], .35)
+    for angle in np.linspace(-math.pi, math.pi, 40):
+        anchor = [0., 0., .45]
+        eye = camera.constrain([3 * math.cos(angle), 3 * math.sin(angle), 2.3], anchor,
+                               bounds_min=ground.bounds_min, bounds_max=ground.bounds_max,
+                               segment_fraction=ground.camera_segment_fraction, dt=.1)
+        assert eye[0] > -1. and eye[2] < 1.5
+        assert ground.camera_segment_fraction(anchor, eye) == pytest.approx(1.)
+
+
+@pytest.mark.parametrize("environment", ["marble", "gpt-v4", "marble-full"])
+def test_video_switch_forwards_for_every_environment(environment):
+    parser = launcher.build_parser()
+    assert parser.parse_args([]).record_video is False
+    args = parser.parse_args(["--environment", environment, "--record-video", "--video-fps", "25"])
+    launcher.validate_args(args, parser)
+    command = launcher.build_runtime_command(args)
+    assert "--record-video" in command
+    assert command[command.index("--video-fps") + 1] == "25.0"
+    assert command[command.index("--video-dir") + 1] == "videos"
+
+
+def test_video_pair_encodes_synchronized_rgb_frames_and_finalizes_mp4(tmp_path):
+    import numpy as np
+    from types import SimpleNamespace
+    cv2 = pytest.importorskip("cv2")
+    module = load_module("walk_video", "tools/environment_walk_video.py")
+    args = SimpleNamespace(video_dir=tmp_path, video_fps=None, render_every=5,
+                           environment="marble-full", camera_mode="follow")
+    recorder = module.WalkVideoRecorder(args)
+    assert recorder.fps == 10.
+    frame = np.zeros((65, 97, 3), dtype=np.uint8)
+    recorder.append(frame, None)
+    assert recorder.frames == 0 and not recorder.paths
+    for index in range(12):
+        frame[:] = [200, index * 10, 0]
+        recorder.append(frame, frame[..., ::-1])
+    recorder.close()
+    recorder.close()
+    assert recorder.frames == 12 and set(recorder.paths) == {"mesh", "gs"}
+    for name, path in recorder.paths.items():
+        capture = cv2.VideoCapture(str(path))
+        assert capture.isOpened() and capture.get(cv2.CAP_PROP_FRAME_COUNT) == 12
+        assert capture.get(cv2.CAP_PROP_FPS) == 10.
+        ok, decoded = capture.read()
+        assert ok and decoded.shape == (66, 98, 3)
+        # RGB -> BGR conversion must preserve mesh-red / GS-blue colors.
+        assert decoded[..., 2 if name == "mesh" else 0].mean() > 180
+        capture.release()
+    with pytest.raises(RuntimeError, match="closed"):
+        recorder.append(frame, frame)
+
+
+@pytest.mark.parametrize("fps", ["0", "-1", "nan", "inf"])
+def test_invalid_video_fps_is_rejected_before_kit(fps):
+    parser = launcher.build_parser()
+    with pytest.raises(SystemExit):
+        launcher.validate_args(parser.parse_args(["--video-fps", fps]), parser)
+
+
+def test_video_launcher_waits_for_finalization_on_ctrl_c(monkeypatch):
+    import signal
+    from types import SimpleNamespace
+    parser = launcher.build_parser()
+    args = parser.parse_args(["--record-video"])
+    launcher.validate_args(args, parser)
+    waits, signals = [], []
+    def wait():
+        waits.append(True)
+        if len(waits) == 1:
+            raise KeyboardInterrupt
+        return 0
+    process = SimpleNamespace(pid=12345, wait=wait, poll=lambda: None)
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *a, **kw: process)
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    monkeypatch.setattr(launcher.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    with pytest.raises(KeyboardInterrupt):
+        launcher.run(args)
+    assert len(waits) == 2 and signals == [(12345, signal.SIGINT)]

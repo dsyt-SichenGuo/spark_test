@@ -9,7 +9,9 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+import signal
 import sys
+import threading
 import time
 import traceback
 
@@ -292,6 +294,61 @@ def episode_camera_view(spawn_pose, goal_xy, *, distance, height, lookahead, seg
             [x + forward * dx, y + forward * dy, z + 0.3])
 
 
+class StableFollowCamera:
+    """Keep the initialized orbit radius/height, ignoring body roll, pitch and bob."""
+
+    def __init__(self, pose, eye, target, smoothing):
+        x, y, z = map(float, pose[:3])
+        self.distance = math.hypot(eye[0] - x, eye[1] - y)
+        self.heading = math.atan2(y - eye[1], x - eye[0])
+        self.eye_height = float(eye[2]) - z
+        self.target_height = float(target[2]) - z
+        self.lookahead = math.hypot(target[0] - x, target[1] - y)
+        self.initial_z = self.anchor_z = z
+        self.smoothing = smoothing
+        self.safe_fraction = 1.
+
+    def update(self, pose, dt, ground_delta=0.):
+        x, y = map(float, pose[:2])
+        qx, qy, qz, qw = map(float, pose[3:7])
+        gain = -math.expm1(-max(0., dt) / self.smoothing)
+        # Retain heading during tumbles rather than flipping the camera with the body.
+        up = 1. - 2. * (qx * qx + qy * qy)
+        if up > .25 and all(math.isfinite(q) for q in (qx, qy, qz, qw)):
+            yaw = math.atan2(2. * (qw * qz + qx * qy), 1. - 2. * (qy * qy + qz * qz))
+            delta = math.atan2(math.sin(yaw - self.heading), math.cos(yaw - self.heading))
+            self.heading += gain * delta
+        if math.isfinite(ground_delta):
+            self.anchor_z += gain * (self.initial_z + ground_delta - self.anchor_z)
+        dx, dy = math.cos(self.heading), math.sin(self.heading)
+        return ([x - self.distance * dx, y - self.distance * dy, self.anchor_z + self.eye_height],
+                [x + self.lookahead * dx, y + self.lookahead * dy, self.anchor_z + self.target_height])
+
+    def constrain(self, eye, anchor, *, bounds_min, bounds_max, dt,
+                  segment_fraction=None, clearance=.18):
+        """Retract immediately at obstacles; recover distance smoothly in free space."""
+        low = [min(float(bounds_min[i]) + clearance, (bounds_min[i] + bounds_max[i]) / 2)
+               for i in range(3)]
+        high = [max(float(bounds_max[i]) - clearance, (bounds_min[i] + bounds_max[i]) / 2)
+                for i in range(3)]
+        # A fallen/out-of-bounds robot must not pull the camera out of the scene.
+        anchor = [max(low[i], min(high[i], float(anchor[i]))) for i in range(3)]
+        direction = [float(eye[i]) - anchor[i] for i in range(3)]
+        fraction = 1.
+        for i, delta in enumerate(direction):
+            if delta > 1e-8:
+                fraction = min(fraction, (high[i] - anchor[i]) / delta)
+            elif delta < -1e-8:
+                fraction = min(fraction, (low[i] - anchor[i]) / delta)
+        if segment_fraction is not None:
+            fraction = min(fraction, segment_fraction(anchor, eye, clearance=clearance))
+        fraction = max(0., min(1., fraction))
+        gain = -math.expm1(-max(0., dt) / self.smoothing)
+        self.safe_fraction = min(fraction, self.safe_fraction + gain * (fraction - self.safe_fraction))
+        # Clamp once more for floating-point roundoff at an exact boundary.
+        return [max(low[i], min(high[i], anchor[i] + self.safe_fraction * direction[i])) for i in range(3)]
+
+
 def create_interior_fill_light(stage, path, position, intensity):
     """Create a soft indoor fill that is not blocked by the enclosing roof."""
     from pxr import Gf, UsdLux
@@ -303,6 +360,33 @@ def create_interior_fill_light(stage, path, position, intensity):
     translate = light.AddTranslateOp()
     translate.Set(Gf.Vec3d(*position))
     return translate
+
+
+def create_marble_mesh_light(stage, path, position, mesh_path, *, shadows=True):
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux
+    light = UsdLux.SphereLight.Define(stage, path)
+    light.CreateIntensityAttr(6000.)
+    light.CreateRadiusAttr(.35)
+    translate = UsdGeom.Xformable(light).AddTranslateOp()
+    translate.Set(Gf.Vec3d(*map(float, position)))
+    link = UsdLux.LightAPI(light.GetPrim()).GetLightLinkCollectionAPI()
+    link.CreateIncludeRootAttr(False)
+    link.CreateExpansionRuleAttr(Usd.Tokens.expandPrims)
+    link.CreateIncludesRel().SetTargets([Sdf.Path(mesh_path)])
+    UsdLux.ShadowAPI.Apply(light.GetPrim()).CreateShadowEnableAttr(shadows)
+    return translate
+
+
+def add_marble_mesh_corridor_lights(stage, env_origins):
+    """Original Marble lamps, linked only to mesh excluded from the GS inset."""
+    positions = [(-7.5, -14.0, 1.25), (-6.0, -11.5, 1.25),
+                 (-4.3, -9.0, 1.25), (-2.5, -6.0, 1.25)]
+    for env_id, origin in enumerate(env_origins):
+        root = f"/World/StaticWalkTask/env_{env_id}"
+        for index, position in enumerate(positions):
+            # Original script positions are aligned world coordinates, not raw USD Z.
+            create_marble_mesh_light(stage, f"{root}/Lighting/MarbleCorridor_{index}",
+                                    [position[i] + float(origin[i]) for i in range(3)], f"{root}/Scene/Environment")
 
 
 def add_static_environment_world(agent, args, asset):
@@ -362,7 +446,10 @@ class EnvironmentTensorPipeline:
         self.asset = ENVIRONMENT_ASSETS[args.environment]
         self.spawn_base_z = args.spawn_height if args.spawn_height is not None else self.asset["spawn_base_z"]
         self.device = torch.device(args.device)
-        self.render_enabled = not args.headless
+        self.compositor = None
+        self.video_recorder = self.video_capture = None
+        self.follow_camera = None
+        self.render_enabled = not args.headless or args.record_video or ("gaussian_dir" in self.asset and args.gaussian_snapshot is not None)
         self.pipeline_step = 0
         self.reset_counts = dict.fromkeys(("fallen", "blocked_or_stalled", "completed", "timeout"), 0)
         self.agent = self.policy = None
@@ -390,7 +477,8 @@ class EnvironmentTensorPipeline:
                 self.asset["world_z_offset"], self.asset["spawn_base_z"] - 0.793,
             )
         self.camera_light = None
-        if args.environment == "marble":
+        self.mesh_camera_light = None
+        if args.environment in ("marble", "marble-full"):
             import omni.usd
             import carb
             stage = omni.usd.get_context().get_stage()
@@ -411,8 +499,18 @@ class EnvironmentTensorPipeline:
                             [x + origin[0], y + origin[1], floor + origin[2] + 1.3],
                             args.interior_light_intensity,
                         )
+                        create_marble_mesh_light(
+                            stage, f"/World/StaticWalkTask/env_{env_id}/Lighting/MarbleMeshFill_{ix}_{iy}",
+                            [x + origin[0], y + origin[1], floor + origin[2] + 1.3],
+                            f"/World/StaticWalkTask/env_{env_id}/Scene/Environment", shadows=False,
+                        )
             self.camera_light = create_interior_fill_light(
                 stage, "/World/StaticWalkTask/CameraFill", [0., 0., 1.], args.camera_light_intensity,
+            )
+            add_marble_mesh_corridor_lights(stage, self.agent.scene.env_origins.detach().cpu().tolist())
+            self.mesh_camera_light = create_marble_mesh_light(
+                stage, "/World/StaticWalkTask/MeshCameraFill", [0., 0., 1.],
+                "/World/StaticWalkTask/env_0/Scene/Environment", shadows=False,
             )
         self.xy_min = torch.tensor(args.xy_min, device=self.device)
         self.xy_max = torch.tensor(args.xy_max, device=self.device)
@@ -425,12 +523,20 @@ class EnvironmentTensorPipeline:
         self.agent.reset(env_ids=all_envs, root_pose_w=self.spawn_poses)
         self.task.reset(all_envs, self.agent.get_feedback())
         self._update_goal_markers()
+        if "gaussian_dir" in self.asset and self.render_enabled:
+            from tools.marble_gaussian_compositor import MarbleGaussianCompositor
+            self.compositor = MarbleGaussianCompositor(args, self.asset, self.device)
         self._refresh_viewer_camera(0)
         self.target = self.agent.default_body_pos.clone()
         self.upper_body_target = self.agent.default_body_pos[:, 12:].clone()
         policy_class = UnitreeG1BatchedWBTPolicy if args.policy == "wbtsafe" else UnitreeG1SportPolicy
         self.policy = policy_class(robot_cfg, num_envs=args.num_envs, device=args.device)
         self.policy.reset(env_ids=all_envs)
+        if args.record_video:
+            from tools.environment_walk_video import WalkVideoRecorder, NativeWalkVideoCapture
+            self.video_recorder = WalkVideoRecorder(args)
+            if self.compositor is None:
+                self.video_capture = NativeWalkVideoCapture()
 
     def _sample_episode(self, env_ids):
         torch = self.torch
@@ -469,7 +575,6 @@ class EnvironmentTensorPipeline:
 
     def _refresh_viewer_camera(self, env_id):
         if self.render_enabled:
-            from isaacsim.core.utils.viewports import set_camera_view
             pose = self.spawn_poses[env_id].detach().cpu()
             goal = self.task.base_goals[env_id, :2].detach().cpu()
             origin = self.agent.scene.env_origins[env_id].detach().cpu()
@@ -484,11 +589,81 @@ class EnvironmentTensorPipeline:
             )
             eye = [eye[i] + float(origin[i]) for i in range(3)]
             target = [target[i] + float(origin[i]) for i in range(3)]
-            set_camera_view(eye=eye, target=target)
-            if self.camera_light is not None:
-                from pxr import Gf
-                self.camera_light.Set(Gf.Vec3d(*eye))
-            print(f"[Environment tensor] camera env_id={env_id}, eye={eye}, target={target}", flush=True)
+            self.camera_env_id = env_id
+            self.camera_origin = origin.tolist()
+            self.camera_last_step = self.pipeline_step
+            self.camera_initial_floor = (self.ground_sampler._height(float(local_pose[0]), float(local_pose[1]))
+                                         if self.ground_sampler is not None else 0.)
+            self.follow_camera = (StableFollowCamera(pose, eye, target, self.args.camera_follow_smoothing)
+                                  if self.args.camera_mode == "follow" else None)
+            if hasattr(self, "viewer_camera"):
+                self.viewer_camera.GetFocalLengthAttr().Set(18.)
+                self.viewer_camera.GetHorizontalApertureAttr().Set(20.955)
+            self._set_camera_view(eye, target)
+            print(f"[Environment tensor] camera env_id={env_id}, mode={self.args.camera_mode}, "
+                  f"eye={eye}, target={target}", flush=True)
+
+    def _set_camera_view(self, eye, target):
+        if not self.args.headless or self.args.record_video:
+            import omni.usd
+            from pxr import Gf, UsdGeom
+            viewport = None
+            if not self.args.headless:
+                from omni.kit.viewport.utility import get_active_viewport
+                viewport = get_active_viewport()
+                if viewport is None:
+                    raise RuntimeError("No active Isaac viewport for the task camera")
+            if not hasattr(self, "viewer_camera"):
+                stage = omni.usd.get_context().get_stage()
+                self.viewer_camera = UsdGeom.Camera.Define(stage, "/World/StaticWalkTask/TaskCamera")
+                self.viewer_camera.CreateClippingRangeAttr((.01, 1000.))
+                self.viewer_camera.CreateFocalLengthAttr(18.)
+                self.viewer_camera.CreateHorizontalApertureAttr(20.955)
+                self.viewer_camera_transform = UsdGeom.Xformable(self.viewer_camera).MakeMatrixXform()
+            camera = self.viewer_camera
+            path = str(camera.GetPath())
+            if viewport is not None and str(viewport.camera_path) != path:
+                viewport.camera_path = path
+            view = Gf.Matrix4d().SetLookAt(Gf.Vec3d(*eye), Gf.Vec3d(*target), Gf.Vec3d(0., 0., 1.))
+            self.viewer_camera_transform.Set(view.GetInverse())
+            camera.CreateFocusDistanceAttr(math.dist(eye, target))
+        if self.compositor is not None:
+            self.compositor.set_view(eye, target, self.camera_origin)
+        if self.camera_light is not None:
+            from pxr import Gf
+            self.camera_light.Set(Gf.Vec3d(*eye))
+        if self.mesh_camera_light is not None:
+            from pxr import Gf, Sdf, UsdLux
+            self.mesh_camera_light.Set(Gf.Vec3d(*eye))
+            light = self.mesh_camera_light.GetAttr().GetPrim()
+            includes = UsdLux.LightAPI(light).GetLightLinkCollectionAPI().GetIncludesRel()
+            targets = [Sdf.Path(f"/World/StaticWalkTask/env_{self.camera_env_id}/Scene/Environment")]
+            if includes.GetTargets() != targets:
+                includes.SetTargets(targets)
+
+    def _update_follow_camera(self):
+        if self.follow_camera is None:
+            return
+        pose = self.agent.get_feedback()["root_pose_w"][self.camera_env_id].detach().cpu().tolist()
+        if not all(math.isfinite(v) for v in pose[:3]):
+            return
+        dt = (self.pipeline_step - self.camera_last_step) * .02
+        self.camera_last_step = self.pipeline_step
+        ground_delta = 0.
+        if self.ground_sampler is not None:
+            floor = self.ground_sampler._height(pose[0] - self.camera_origin[0], pose[1] - self.camera_origin[1])
+            ground_delta = floor - self.camera_initial_floor
+        eye, target = self.follow_camera.update(pose, dt, ground_delta)
+        origin = self.camera_origin
+        eye_local = [eye[i] - origin[i] for i in range(3)]
+        anchor = [pose[0] - origin[0], pose[1] - origin[1], self.follow_camera.anchor_z - origin[2] + .15]
+        eye_local = self.follow_camera.constrain(
+            eye_local, anchor, bounds_min=self.args.camera_bounds_min, bounds_max=self.args.camera_bounds_max,
+            dt=dt, clearance=self.args.camera_clearance,
+            segment_fraction=(self.ground_sampler.camera_segment_fraction if self.ground_sampler is not None else None),
+        )
+        eye = [eye_local[i] + origin[i] for i in range(3)]
+        self._set_camera_view(eye, target)
 
     def _infer_policy(self, feedback, command):
         torch = self.torch
@@ -552,14 +727,40 @@ class EnvironmentTensorPipeline:
         self.agent.step(self.target, action_info=action_info)
         self._reset_rows(self.task.update_after_step(self.agent.get_feedback()))
         if self.render_enabled and self.pipeline_step % self.args.render_every == 0:
-            self.agent.render_frame()
+            self._render_frame()
         self.pipeline_step += 1
+
+    def _render_frame(self, *, record=True):
+        self._update_follow_camera()
+        if self.compositor is None and self.video_capture is None:
+            self.agent.render_frame()
+            return
+        # RTX may pump Kit; protect robot state while generating visual frames.
+        state = self.agent._snapshot_camera_render_state()
+        try:
+            if self.compositor is not None:
+                previous_frames = self.compositor.frames
+                self.compositor.prepare()
+            if self.video_capture is not None:
+                self.video_capture.prepare(self.args.headless)
+            self.agent.render_frame()
+            if self.compositor is not None:
+                self.compositor.update()
+                if record and self.video_recorder is not None and self.compositor.frames > previous_frames:
+                    self.video_recorder.append(self.compositor.last_native_image, self.compositor.last_image)
+            elif record and self.video_recorder is not None:
+                self.video_recorder.append(self.video_capture.frame())
+        finally:
+            self.agent._restore_camera_render_state(state)
 
     def run(self):
         print(f"[Environment tensor] running {self.args.num_envs} environment(s), "
               f"policy={self.args.policy}, scalar_api={self.agent.scalar_api}", flush=True)
         try:
             while self.args.steps < 0 or self.pipeline_step < self.args.steps:
+                if getattr(self, "recording_stop", None) is not None and self.recording_stop.is_set():
+                    print("[Video] stop requested; finalizing recordings", flush=True)
+                    break
                 if not self.app.is_running():
                     break
                 started = time.perf_counter()
@@ -570,6 +771,11 @@ class EnvironmentTensorPipeline:
                         time.sleep(remaining)
         except KeyboardInterrupt:
             print("[Environment tensor] interrupted", flush=True)
+        if self.compositor is not None and self.args.gaussian_snapshot is not None:
+            # Submit several frames so the final capture includes the latest reset.
+            for _ in range(5):
+                self._render_frame(record=False)
+            self.compositor.save(self.args.gaussian_snapshot)
         feedback = self.agent.get_feedback()
         if not bool(self.torch.isfinite(feedback["root_pose_w"]).all().item()):
             raise RuntimeError("non-finite final robot pose")
@@ -577,6 +783,14 @@ class EnvironmentTensorPipeline:
               f"final_root_pose_w={feedback['root_pose_w'].detach().cpu().tolist()}", flush=True)
 
     def close(self):
+        try:
+            if getattr(self, "video_recorder", None) is not None:
+                self.video_recorder.close()
+        finally:
+            if getattr(self, "video_capture", None) is not None:
+                self.video_capture.close()
+        if getattr(self, "compositor", None) is not None:
+            self.compositor.close()
         if self.policy is not None and hasattr(self.policy, "close"):
             self.policy.close()
         if self.agent is not None:
@@ -603,12 +817,27 @@ def main():
         args.hide_ui = False
         if not args.experience:
             args.experience = "isaacsim.exp.base.kit" if args.num_envs == 1 else "isaacsim.exp.base.python.kit"
+    if args.record_video:
+        args.enable_cameras = True
+    if args.environment == "marble-full" and (not args.headless or args.gaussian_snapshot is not None or args.record_video):
+        from tools.marble_gaussian_compositor import preflight_gaussian_renderer
+        preflight_gaussian_renderer(args.device)
+        args.enable_cameras = True
     launcher = AppLauncher(args)
+    recording_stop = threading.Event()
+    if args.record_video:
+        # SimulationApp's SIGINT handler force-unloads Kit before Python finally
+        # blocks can release encoders. Finish a complete paired frame instead.
+        def request_recording_stop(signum, frame):
+            recording_stop.set()
+        signal.signal(signal.SIGINT, request_recording_stop)
+        signal.signal(signal.SIGTERM, request_recording_stop)
     pipeline = EnvironmentTensorPipeline.__new__(EnvironmentTensorPipeline)
     pipeline.agent = pipeline.policy = None
     exit_code = 0
     try:
         pipeline.__init__(args, launcher.app)
+        pipeline.recording_stop = recording_stop
         pipeline.run()
     except Exception:
         # Kit shutdown can terminate the interpreter; report failures first.
